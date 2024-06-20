@@ -45,7 +45,7 @@ namespace icbc {
     //float evaluate_bc4_error(const float rgba_block[16 * 4], const void * block, bool snorm, Decoder decoder = Decoder_D3D10);
     //float evaluate_bc5_error(const float rgba_block[16 * 4], const void * block, bool snorm, Decoder decoder = Decoder_D3D10);
 
-    float compress_bc1(Quality level, const float * input_colors, const float * input_weights, const float color_weights[3], bool three_color_mode, bool three_color_black, void * output);
+	float compress_bc1(Quality level, const float * input_colors, bool three_color_mode, bool three_color_black, void * output);
     float compress_bc3(Quality level, const float * input_colors, const float * input_weights, const float color_weights[3], bool six_alpha_mode, void * output);
     //float compress_bc4(Quality level, const float * input_colors, const float * input_weights, bool snorm, bool six_alpha_mode, void * output);
     //float compress_bc5(Quality level, const float * input_colors, const float * input_weights, bool snorm, bool six_alpha_mode, void * output);
@@ -1680,7 +1680,7 @@ inline bool is_black(Vector3 c) {
 }
 
 // Find similar colors and combine them together.
-static int reduce_colors(const Vector4 * input_colors, const float * input_weights, int count, float threshold, Vector3 * colors, float * weights, bool * any_black)
+static int reduce_colors(const Vector4 * input_colors, int count, float threshold, Vector3 * colors, bool * any_black, bool *any_transparent)
 {
 #if 0
     for (int i = 0; i < 16; i++) {
@@ -1690,35 +1690,37 @@ static int reduce_colors(const Vector4 * input_colors, const float * input_weigh
     return 16;
 #else
     *any_black = false;
+	*any_transparent = false;
 
     int n = 0;
     for (int i = 0; i < count; i++)
     {
         Vector3 ci = input_colors[i].xyz;
-        float wi = input_weights[i];
 
-        if (wi > 0) {
-            // Find matching color.
-            int j;
-            for (j = 0; j < n; j++) {
-                if (equal(colors[j], ci, threshold)) {
-                    colors[j] = (colors[j] * weights[j] + ci * wi) / (weights[j] + wi);
-                    weights[j] += wi;
-                    break;
-                }
-            }
+		if (input_colors[i].w < 0.5f)
+		{
+			*any_transparent = true;
+			continue;
+		}
 
-            // No match found. Add new color.
-            if (j == n) {
-                colors[n] = ci;
-                weights[n] = wi;
-                n++;
-            }
+		// Find matching color.
+		int j;
+		for (j = 0; j < n; j++) {
+			if (equal(colors[j], ci, threshold)) {
+				colors[j] = ci;
+				break;
+			}
+		}
 
-            if (is_black(ci)) {
-                *any_black = true;
-            }
-        }
+		// No match found. Add new color.
+		if (j == n) {
+			colors[n] = ci;
+			n++;
+		}
+
+		if (is_black(ci)) {
+			*any_black = true;
+		}
     }
 
     ICBC_ASSERT(n <= count);
@@ -1727,20 +1729,18 @@ static int reduce_colors(const Vector4 * input_colors, const float * input_weigh
 #endif
 }
 
-static int skip_blacks(const Vector3 * input_colors, const float * input_weights, int count, Vector3 * colors, float * weights)
+static int skip_blacks(const Vector3 * input_colors, int count, Vector3 * colors)
 {
     int n = 0;
     for (int i = 0; i < count; i++)
     {
         Vector3 ci = input_colors[i];
-        float wi = input_weights[i];
 
         if (is_black(ci)) {
             continue;
         }
 
         colors[n] = ci;
-        weights[n] = wi;
         n += 1;
     }
 
@@ -1752,25 +1752,23 @@ static int skip_blacks(const Vector3 * input_colors, const float * input_weights
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // PCA
 
-static Vector3 computeCentroid(int n, const Vector3 *__restrict points, const float *__restrict weights)
+static Vector3 computeCentroid(int n, const Vector3 *__restrict points)
 {
     Vector3 centroid = { 0 };
-    float total = 0.0f;
 
     for (int i = 0; i < n; i++)
     {
-        total += weights[i];
-        centroid += weights[i] * points[i];
+		centroid += points[i];
     }
-    centroid *= (1.0f / total);
+	centroid *= (1.0f / n);
 
     return centroid;
 }
 
-static Vector3 computeCovariance(int n, const Vector3 *__restrict points, const float *__restrict weights, float *__restrict covariance)
+static Vector3 computeCovariance(int n, const Vector3 *__restrict points, float *__restrict covariance)
 {
     // compute the centroid
-    Vector3 centroid = computeCentroid(n, points, weights);
+	Vector3 centroid = computeCentroid(n, points);
 
     // compute covariance matrix
     for (int i = 0; i < 6; i++)
@@ -1781,7 +1779,7 @@ static Vector3 computeCovariance(int n, const Vector3 *__restrict points, const 
     for (int i = 0; i < n; i++)
     {
         Vector3 a = (points[i] - centroid);    // @@ I think weight should be squared, but that seems to increase the error slightly.
-        Vector3 b = weights[i] * a;
+		Vector3 b = a;
 
         covariance[0] += a.x * b.x;
         covariance[1] += a.x * b.y;
@@ -1835,10 +1833,10 @@ static inline Vector3 firstEigenVector_PowerMethod(const float *__restrict matri
     return v;
 }
 
-static Vector3 computePrincipalComponent_PowerMethod(int n, const Vector3 *__restrict points, const float *__restrict weights)
+static Vector3 computePrincipalComponent_PowerMethod(int n, const Vector3 *__restrict points)
 {
     float matrix[6];
-    computeCovariance(n, points, weights, matrix);
+	computeCovariance(n, points, matrix);
 
     return firstEigenVector_PowerMethod(matrix);
 }
@@ -1854,10 +1852,10 @@ struct SummedAreaTable {
     ICBC_ALIGN float w[16];
 };
 
-int compute_sat(const Vector3 * colors, const float * weights, int count, SummedAreaTable * sat)
+int compute_sat(const Vector3 * colors, int count, SummedAreaTable * sat)
 {
     // I've tried using a lower quality approximation of the principal direction, but the best fit line seems to produce best results.
-    Vector3 principal = computePrincipalComponent_PowerMethod(count, colors, weights);
+	Vector3 principal = computePrincipalComponent_PowerMethod(count, colors);
 
     // build the list of values
     int order[16];
@@ -1912,18 +1910,16 @@ int compute_sat(const Vector3 * colors, const float * weights, int count, Summed
     }
 #endif
 
-    float w = weights[order[0]];
-    sat->r[0] = colors[order[0]].x * w;
-    sat->g[0] = colors[order[0]].y * w;
-    sat->b[0] = colors[order[0]].z * w;
-    sat->w[0] = w;
+	sat->r[0] = colors[order[0]].x;
+	sat->g[0] = colors[order[0]].y;
+	sat->b[0] = colors[order[0]].z;
+	sat->w[0] = 1.0f;
 
     for (int i = 1; i < count; i++) {
-        w = weights[order[i]];
-        sat->r[i] = sat->r[i - 1] + colors[order[i]].x * w;
-        sat->g[i] = sat->g[i - 1] + colors[order[i]].y * w;
-        sat->b[i] = sat->b[i - 1] + colors[order[i]].z * w;
-        sat->w[i] = sat->w[i - 1] + w;
+		sat->r[i] = sat->r[i - 1] + colors[order[i]].x;
+		sat->g[i] = sat->g[i - 1] + colors[order[i]].y;
+		sat->b[i] = sat->b[i - 1] + colors[order[i]].z;
+		sat->w[i] = sat->w[i - 1] + 1.0;
     }
 
     for (int i = count; i < 16; i++) {
@@ -2072,7 +2068,7 @@ static void init_cluster_tables() {
 
 
 
-static void cluster_fit_three(const SummedAreaTable & sat, int count, Vector3 metric_sqr, Vector3 * start, Vector3 * end)
+static void cluster_fit_three(const SummedAreaTable & sat, int count, Vector3 * start, Vector3 * end)
 {
     const float r_sum = sat.r[count-1];
     const float g_sum = sat.g[count-1];
@@ -2320,7 +2316,7 @@ static void cluster_fit_three(const SummedAreaTable & sat, int count, Vector3 me
         VVector3 e1 = vmadd(a * a, alpha2_sum, vmadd(b * b, beta2_sum, e2));
 
         // apply the metric to the error term
-        VFloat error = vdot(e1, vbroadcast(metric_sqr));
+		VFloat error = vdot(e1, vbroadcast(1.0f, 1.0f, 1.0f));
 
 
         // keep the solution if it wins
@@ -2345,7 +2341,7 @@ static void cluster_fit_three(const SummedAreaTable & sat, int count, Vector3 me
 }
 
 
-static void cluster_fit_four(const SummedAreaTable & sat, int count, Vector3 metric_sqr, Vector3 * start, Vector3 * end)
+static void cluster_fit_four(const SummedAreaTable & sat, int count, Vector3 * start, Vector3 * end)
 {
     const float r_sum = sat.r[count-1];
     const float g_sum = sat.g[count-1];
@@ -2719,7 +2715,7 @@ static void cluster_fit_four(const SummedAreaTable & sat, int count, Vector3 met
         VVector3 e1 = vmadd(a * a, alpha2_sum, vmadd(b * b, beta2_sum, e2));
 
         // apply the metric to the error term
-        VFloat error = vdot(e1, vbroadcast(metric_sqr));
+		VFloat error = vdot(e1, vbroadcast(1.0f, 1.0f, 1.0f));
 
         // keep the solution if it wins
         auto mask = (error < vbesterror);
@@ -3094,18 +3090,17 @@ ICBC_FORCEINLINE uint32 interleave(uint32 a, uint32 b) {
 #endif
 }
 
-static uint compute_indices4(const Vector4 input_colors[16], const Vector3 & color_weights, const Vector3 palette[4]) {
+static uint compute_indices4(const Vector4 input_colors[16], const Vector3 palette[4]) {
     uint indices0 = 0;
     uint indices1 = 0;
 
-    VVector3 vw = vbroadcast(color_weights);
-    VVector3 vp0 = vbroadcast(palette[0]) * vw;
-    VVector3 vp1 = vbroadcast(palette[1]) * vw;
-    VVector3 vp2 = vbroadcast(palette[2]) * vw;
-    VVector3 vp3 = vbroadcast(palette[3]) * vw;
+	VVector3 vp0 = vbroadcast(palette[0]);
+	VVector3 vp1 = vbroadcast(palette[1]);
+	VVector3 vp2 = vbroadcast(palette[2]);
+	VVector3 vp3 = vbroadcast(palette[3]);
 
     for (int i = 0; i < 16; i += VEC_SIZE) {
-        VVector3 vc = vload(&input_colors[i]) * vw;
+		VVector3 vc = vload(&input_colors[i]);
 
         VFloat d0 = vlen2(vc - vp0);
         VFloat d1 = vlen2(vc - vp1);
@@ -3130,18 +3125,17 @@ static uint compute_indices4(const Vector4 input_colors[16], const Vector3 & col
     return interleave(indices1, indices0);
 }
 
-static uint compute_indices3(const Vector4 input_colors[16], const Vector3 & color_weights, bool allow_transparent_black, const Vector3 palette[4]) {
+static uint compute_indices3(const Vector4 input_colors[16], bool allow_transparent_black, const Vector3 palette[4]) {
     uint indices0 = 0;
     uint indices1 = 0;
 
-    VVector3 vw = vbroadcast(color_weights);
-    VVector3 vp0 = vbroadcast(palette[0]) * vw;
-    VVector3 vp1 = vbroadcast(palette[1]) * vw;
-    VVector3 vp2 = vbroadcast(palette[2]) * vw;
+	VVector3 vp0 = vbroadcast(palette[0]);
+	VVector3 vp1 = vbroadcast(palette[1]);
+	VVector3 vp2 = vbroadcast(palette[2]);
 
     if (allow_transparent_black) {
         for (int i = 0; i < 16; i += VEC_SIZE) {
-            VVector3 vc = vload(&input_colors[i]) * vw;
+			VVector3 vc = vload(&input_colors[i]);
 
             VFloat d0 = vlen2(vp0 - vc);
             VFloat d1 = vlen2(vp1 - vc);
@@ -3158,7 +3152,7 @@ static uint compute_indices3(const Vector4 input_colors[16], const Vector3 & col
     }
     else {
         for (int i = 0; i < 16; i += VEC_SIZE) {
-            VVector3 vc = vload(&input_colors[i]) * vw;
+			VVector3 vc = vload(&input_colors[i]);
 
             VFloat d0 = vlen2(vc - vp0);
             VFloat d1 = vlen2(vc - vp1);
@@ -3172,11 +3166,18 @@ static uint compute_indices3(const Vector4 input_colors[16], const Vector3 & col
         }
     }
 
-    return interleave(indices1, indices0);
+	uint ret = interleave(indices1, indices0);
+	if(!allow_transparent_black)
+	{
+		for(int i=0; i<16; i++)
+			if(input_colors[i].w < 0.5)
+				ret |= 0x3 << i * 2;
+	}
+	return ret;
 }
 
 
-static uint compute_indices(const Vector4 input_colors[16], const Vector3 & color_weights, const Vector3 palette[4]) {
+static uint compute_indices(const Vector4 input_colors[16], const Vector3 palette[4]) {
 #if 0
     Vector3 p0 = palette[0] * color_weights;
     Vector3 p1 = palette[1] * color_weights;
@@ -3205,14 +3206,13 @@ static uint compute_indices(const Vector4 input_colors[16], const Vector3 & colo
     uint indices0 = 0;
     uint indices1 = 0;
 
-    VVector3 vw = vbroadcast(color_weights);
-    VVector3 vp0 = vbroadcast(palette[0]) * vw;
-    VVector3 vp1 = vbroadcast(palette[1]) * vw;
-    VVector3 vp2 = vbroadcast(palette[2]) * vw;
-    VVector3 vp3 = vbroadcast(palette[3]) * vw;
+	VVector3 vp0 = vbroadcast(palette[0]);
+	VVector3 vp1 = vbroadcast(palette[1]);
+	VVector3 vp2 = vbroadcast(palette[2]);
+	VVector3 vp3 = vbroadcast(palette[3]);
 
     for (int i = 0; i < 16; i += VEC_SIZE) {
-        VVector3 vc = vload(&input_colors[i]) * vw;
+		VVector3 vc = vload(&input_colors[i]);
 
         VFloat d0 = vlen2(vc - vp0);
         VFloat d1 = vlen2(vc - vp1);
@@ -3235,12 +3235,12 @@ static uint compute_indices(const Vector4 input_colors[16], const Vector3 & colo
 }
 
 
-static float output_block3(const Vector4 input_colors[16], const float input_weights[16], const Vector3 & color_weights, bool allow_transparent_black, const Vector3 & v0, const Vector3 & v1, BlockBC1 * block)
+static float output_block3(const Vector4 input_colors[16], bool allow_transparent_black, const Vector3 & v0, const Vector3 & v1, BlockBC1 * block)
 {
     Color16 color0 = vector3_to_color16(v0);
     Color16 color1 = vector3_to_color16(v1);
 
-    if (color0.u > color1.u) {
+	if (color0.u > color1.u) {
         swap(color0, color1);
     }
 
@@ -3249,12 +3249,12 @@ static float output_block3(const Vector4 input_colors[16], const float input_wei
 
     block->col0 = color0;
     block->col1 = color1;
-    block->indices = compute_indices3(input_colors, color_weights, allow_transparent_black, palette);
+	block->indices = compute_indices3(input_colors, allow_transparent_black, palette);
 
-    return evaluate_mse(input_colors, input_weights, color_weights, palette, block->indices);
+	return 0;
 }
 
-static float output_block4(const Vector4 input_colors[16], const float input_weights[16], const Vector3 & color_weights, const Vector3 & v0, const Vector3 & v1, BlockBC1 * block)
+static float output_block4(const Vector4 input_colors[16], const Vector3 & v0, const Vector3 & v1, BlockBC1 * block)
 {
     Color16 color0 = vector3_to_color16(v0);
     Color16 color1 = vector3_to_color16(v1);
@@ -3268,9 +3268,9 @@ static float output_block4(const Vector4 input_colors[16], const float input_wei
 
     block->col0 = color0;
     block->col1 = color1;
-    block->indices = compute_indices4(input_colors, color_weights, palette);
+	block->indices = compute_indices4(input_colors, palette);
 
-    return evaluate_mse(input_colors, input_weights, color_weights, palette, block->indices);
+	return 0;
 }
 
 
@@ -3526,40 +3526,42 @@ static void compress_dxt1_single_color_optimal(Color32 c, BlockBC1 * output)
     output->col1.b = s_match5[c.b][1];
     output->indices = 0xaaaaaaaa;
 
-    if (output->col0.u < output->col1.u)
+	if (output->col0.u > output->col1.u)
     {
         swap(output->col0.u, output->col1.u);
-        output->indices ^= 0x55555555;
+		//output->indices ^= 0x55555555;
     }
 }
 
 
-static float compress_dxt1_cluster_fit(const Vector4 input_colors[16], const float input_weights[16], const Vector3 * colors, const float * weights, int count, const Vector3 & color_weights, bool three_color_mode, bool try_transparent_black, bool allow_transparent_black, BlockBC1 * output)
+static float compress_dxt1_cluster_fit(const Vector4 input_colors[16], const Vector3 * colors, int count, bool three_color_mode, bool try_transparent_black, bool allow_transparent_black, BlockBC1 * output)
 {
-    Vector3 metric_sqr = color_weights * color_weights;
-
     SummedAreaTable sat;
-    int sat_count = compute_sat(colors, weights, count, &sat);
+	int sat_count = compute_sat(colors, count, &sat);
 
     Vector3 start, end;
-    cluster_fit_four(sat, sat_count, metric_sqr, &start, &end);
+	cluster_fit_four(sat, sat_count, &start, &end);
 
-    float best_error = output_block4(input_colors, input_weights, color_weights, start, end, output);
+	float best_error;
+	if(allow_transparent_black)
+		best_error = output_block4(input_colors, start, end, output);
+	else
+		best_error = output_block3(input_colors, false, start, end, output);
 
     if (three_color_mode) {
         if (try_transparent_black) {
             Vector3 tmp_colors[16];
             float tmp_weights[16];
-            int tmp_count = skip_blacks(colors, weights, count, tmp_colors, tmp_weights);
+			int tmp_count = skip_blacks(colors, count, tmp_colors);
             if (!tmp_count) return best_error;
 
-            sat_count = compute_sat(tmp_colors, tmp_weights, tmp_count, &sat);
+			sat_count = compute_sat(tmp_colors, tmp_count, &sat);
         }
 
-        cluster_fit_three(sat, sat_count, metric_sqr, &start, &end);
+		cluster_fit_three(sat, sat_count, &start, &end);
 
         BlockBC1 three_color_block;
-        float three_color_error = output_block3(input_colors, input_weights, color_weights, allow_transparent_black, start, end, &three_color_block);
+		float three_color_error = output_block3(input_colors, allow_transparent_black, start, end, &three_color_block);
 
         if (three_color_error < best_error) {
             best_error = three_color_error;
@@ -3571,7 +3573,7 @@ static float compress_dxt1_cluster_fit(const Vector4 input_colors[16], const flo
 }
 
 
-static float refine_endpoints(const Vector4 input_colors[16], const float input_weights[16], const Vector3 & color_weights, bool three_color_mode, float input_error, BlockBC1 * output) {
+static float refine_endpoints(const Vector4 input_colors[16], bool three_color_mode, float input_error, BlockBC1 * output) {
     // TODO:
     // - Optimize palette evaluation when updating only one channel.
     // - try all diagonals.
@@ -3634,9 +3636,11 @@ static float refine_endpoints(const Vector4 input_colors[16], const float input_
         Vector3 palette[4];
         evaluate_palette(output->col0, output->col1, palette);
 
-        refined.indices = compute_indices(input_colors, color_weights, palette);
+		refined.indices = compute_indices(input_colors, palette);
 
-        float refined_error = evaluate_mse(input_colors, input_weights, color_weights, &refined);
+		float weights[16] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0};
+		Vector3 color_weights;
+		float refined_error = evaluate_mse(input_colors, weights, color_weights, &refined);
         if (refined_error < best_error) {
             best_error = refined_error;
             *output = refined;
@@ -3731,36 +3735,48 @@ static Options setup_options(Quality level, bool enable_three_color_mode, bool e
 }
 
 
-static float compress_bc1(Quality level, const Vector4 input_colors[16], const float input_weights[16], const Vector3 & color_weights, bool three_color_mode, bool three_color_black, BlockBC1 * output)
+static float compress_bc1(Quality level, const Vector4 input_colors[16], bool three_color_mode, bool three_color_black, BlockBC1 * output)
 {
     Options opt = setup_options(level, three_color_mode, three_color_black);
 
     Vector3 colors[16];
     float weights[16];
     bool any_black = false;
+	bool any_tranparent = false;
     int count;
     if (opt.cluster_fit) {
-        count = reduce_colors(input_colors, input_weights, 16, opt.threshold, colors, weights, &any_black);
+		count = reduce_colors(input_colors, 16, opt.threshold, colors, &any_black, &any_tranparent);
     }
     else {
+		int o = 0;
         for (int i = 0; i < 16; i++) {
-            colors[i] = input_colors[i].xyz;
+			if(input_colors[i].w > 0.5f)
+				colors[o++] = input_colors[i].xyz;
+			else
+				any_tranparent = true;
         }
-        count = 16;
+		count = o;
     }
 
     if (count == 0) {
         // Output trivial block.
         output->col0.u = 0;
         output->col1.u = 0;
-        output->indices = 0;
+		if(any_tranparent)output->indices = 0xffffffff;
+		else output->indices = 0;
         return 0;
     }
 
     // Cluster fit cannot handle single color blocks, so encode them optimally.
     if (count == 1) {
-        compress_dxt1_single_color_optimal(vector3_to_color32(colors[0]), output);
-        return evaluate_mse(input_colors, input_weights, color_weights, output);
+		//compress_dxt1_single_color_optimal(vector3_to_color32(colors[0]), output);
+		output->col0 = output->col1 = vector3_to_color16(colors[0]);
+		output->indices = 0;
+		if(any_tranparent)
+			for(int i=0; i<16; i++)
+				if(input_colors[i].w < 0.5f)
+					output->indices |= 0x3 << i * 2;
+		return 0;
     }
 
     float error = FLT_MAX;
@@ -3769,14 +3785,21 @@ static float compress_bc1(Quality level, const Vector4 input_colors[16], const f
     if (opt.box_fit) {
         Vector3 c0, c1;
         fit_colors_bbox(colors, count, &c0, &c1);
-        inset_bbox(&c0, &c1);
+		//inset_bbox(&c0, &c1);
         select_diagonal(colors, count, &c0, &c1);
-        error = output_block4(input_colors, input_weights, color_weights, c0, c1, output);
+		if(any_tranparent)
+			error = output_block3(input_colors, false, c0, c1, output);
+		else
+			error = output_block4(input_colors, c0, c1, output);
 
         // Refine color for the selected indices.
         if (opt.least_squares_fit && optimize_end_points4(output->indices, input_colors, 16, &c0, &c1)) {
             BlockBC1 optimized_block;
-            float optimized_error = output_block4(input_colors, input_weights, color_weights, c0, c1, &optimized_block);
+			float optimized_error;
+			if(any_tranparent)
+				optimized_error = output_block3(input_colors, false, c0, c1, &optimized_block);
+			else
+				optimized_error = output_block4(input_colors, c0, c1, &optimized_block);
 
             if (optimized_error < error) {
                 error = optimized_error;
@@ -3788,12 +3811,12 @@ static float compress_bc1(Quality level, const Vector4 input_colors[16], const f
     if (opt.cluster_fit) {
         // @@ Use current endpoints as input for initial PCA approximation?
 
-        bool use_three_color_black = any_black && three_color_black;
+		bool use_three_color_black = any_black && three_color_black;
         bool use_three_color_mode = opt.cluster_fit_3 || (use_three_color_black && opt.cluster_fit_3_black_only);
 
         // Try cluster fit.
         BlockBC1 cluster_fit_output;
-        float cluster_fit_error = compress_dxt1_cluster_fit(input_colors, input_weights, colors, weights, count, color_weights, use_three_color_mode, use_three_color_black, three_color_black, &cluster_fit_output);
+		float cluster_fit_error = compress_dxt1_cluster_fit(input_colors, colors, count, use_three_color_mode, use_three_color_black && !any_tranparent, three_color_black && !any_tranparent, &cluster_fit_output);
         if (cluster_fit_error < error) {
             *output = cluster_fit_output;
             error = cluster_fit_error;
@@ -3801,7 +3824,7 @@ static float compress_bc1(Quality level, const Vector4 input_colors[16], const f
     }
 
     if (opt.endpoint_refinement) {
-        error = refine_endpoints(input_colors, input_weights, color_weights, three_color_mode, error, output);
+		error = refine_endpoints(input_colors, three_color_mode, error, output);
     }
 
     return error;
@@ -3843,8 +3866,8 @@ float evaluate_bc3_error(const unsigned char rgba_block[16 * 4], const void * dx
 }
 
 
-float compress_bc1(Quality level, const float * input_colors, const float * input_weights, const float rgb[3], bool three_color_mode, bool three_color_black, void * output) {
-    return compress_bc1(level, (Vector4*)input_colors, input_weights, { rgb[0], rgb[1], rgb[2] }, three_color_mode, three_color_black, (BlockBC1*)output);
+float compress_bc1(Quality level, const float * input_colors, bool three_color_mode, bool three_color_black, void * output) {
+	return compress_bc1(level, (Vector4*)input_colors, three_color_mode, three_color_black, (BlockBC1*)output);
 }
 
 float compress_bc3(Quality level, const float * input_colors, const float * input_weights, const float rgb[3], bool six_alpha_mode, void * output) {
